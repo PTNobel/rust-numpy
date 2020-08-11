@@ -217,37 +217,54 @@ impl MultiIterMode for () {
     type Pre = ();
 }
 
-/// Represents the iterator mode where the last array is readonly.
-pub struct RO<S: MultiIterMode>(PhantomData<S>);
+// https://stackoverflow.com/questions/57454887/how-do-i-append-to-a-tuple
+pub trait TupleAppend<T> {
+    private_decl!();
+    type ResultType;
 
-impl<S: MultiIterMode> MultiIterMode for RO<S> {
-    private_impl!();
-    type Pre = S;
-    const FLAG: npy_uint32 = NPY_ITER_READONLY;
+    fn append(self, t: T) -> Self::ResultType;
 }
 
-/// Represents the iterator mode where the last array is readwrite.
-pub struct RW<S: MultiIterMode>(PhantomData<S>);
-
-impl<S: MultiIterMode> MultiIterMode for RW<S> {
+impl<T> TupleAppend<T> for () {
     private_impl!();
-    type Pre = S;
-    const FLAG: npy_uint32 = NPY_ITER_READWRITE;
+    type ResultType = (T,);
+
+    fn append(self, t: T) -> Self::ResultType {
+        (t,)
+    }
 }
 
-/// Represents the iterator mode where at least two arrays are iterated.
-pub trait MultiIterModeWithManyArrays: MultiIterMode {}
-impl MultiIterModeWithManyArrays for RO<RO<()>> {}
-impl MultiIterModeWithManyArrays for RO<RW<()>> {}
-impl MultiIterModeWithManyArrays for RW<RO<()>> {}
-impl MultiIterModeWithManyArrays for RW<RW<()>> {}
+macro_rules! impl_tuple_append {
+    ( () ) => {};
+    ( ( $t0:ident $(, $types:ident)* ) ) => {
+        impl<$t0, $($types,)* T> TupleAppend<T> for ($t0, $($types,)*) {
+            private_impl!();
+            // Trailing comma, just to be extra sure we are dealing
+            // with a tuple and not a parenthesized type/expr.
+            type ResultType = ($t0, $($types,)* T,);
 
-impl<S: MultiIterModeWithManyArrays> MultiIterModeWithManyArrays for RO<S> {}
-impl<S: MultiIterModeWithManyArrays> MultiIterModeWithManyArrays for RW<S> {}
+            fn append(self, t: T) -> Self::ResultType {
+                // Reuse the type identifiers to destructure ourselves:
+                let ($t0, $($types,)*) = self;
+                // Create a new tuple with the original elements, plus the new one:
+                ($t0, $($types,)* t,)
+            }
+        }
+
+        // Recurse for one smaller size:
+        impl_tuple_append! { ($($types),*) }
+    };
+}
+
+impl_tuple_append! {
+    // Supports tuples up to size 10:
+    (_1, _2, _3, _4, _5, _6, _7, _8, _9, _10)
+}
 
 /// A builder struct for creating multi iterator.
-pub struct NpyMultiIterBuilder<'py, T, S: MultiIterMode> {
+pub struct NpyMultiIterBuilder<'py, T, S> {
     flags: npy_uint32,
+    opflags: Vec<npy_uint32>,
     arrays: Vec<&'py PyArrayDyn<T>>,
     structure: PhantomData<S>,
 }
@@ -256,6 +273,7 @@ impl<'py, T: Element> NpyMultiIterBuilder<'py, T, ()> {
     pub fn new() -> Self {
         Self {
             flags: 0,
+            opflags: Vec::new(),
             arrays: Vec::new(),
             structure: PhantomData,
         }
@@ -272,40 +290,44 @@ impl<'py, T: Element> NpyMultiIterBuilder<'py, T, ()> {
     }
 }
 
-impl<'py, T: Element, S: MultiIterMode> NpyMultiIterBuilder<'py, T, S> {
+impl<'py, T: Element, S: TupleAppend<&'py T>> NpyMultiIterBuilder<'py, T, S> {
     pub fn add_readonly_array<D: ndarray::Dimension>(
         mut self,
         array: &'py PyArray<T, D>,
-    ) -> NpyMultiIterBuilder<'py, T, RO<S>> {
+    ) -> NpyMultiIterBuilder<'py, T, S::ResultType> {
         self.arrays.push(array.to_dyn());
+        self.opflags.push(NPY_ITER_READONLY);
 
         NpyMultiIterBuilder {
             flags: self.flags,
-            arrays: self.arrays,
-            structure: PhantomData,
-        }
-    }
-
-    pub fn add_readwrite_array<D: ndarray::Dimension>(
-        mut self,
-        array: &'py PyArray<T, D>,
-    ) -> NpyMultiIterBuilder<'py, T, RW<S>> {
-        self.arrays.push(array.to_dyn());
-
-        NpyMultiIterBuilder {
-            flags: self.flags,
+            opflags: self.opflags,
             arrays: self.arrays,
             structure: PhantomData,
         }
     }
 }
 
-impl<'py, T: Element, S: MultiIterModeWithManyArrays> NpyMultiIterBuilder<'py, T, S> {
+impl<'py, T: Element, S: TupleAppend<&'py mut T>> NpyMultiIterBuilder<'py, T, S> {
+    pub fn add_readwrite_array<D: ndarray::Dimension>(
+        mut self,
+        array: &'py PyArray<T, D>,
+    ) -> NpyMultiIterBuilder<'py, T, S::ResultType> {
+        self.arrays.push(array.to_dyn());
+        self.opflags.push(NPY_ITER_READWRITE);
+
+        NpyMultiIterBuilder {
+            flags: self.flags,
+            opflags: self.opflags,
+            arrays: self.arrays,
+            structure: PhantomData,
+        }
+    }
+}
+
+impl<'py, T: Element, S> NpyMultiIterBuilder<'py, T, S> {
     pub fn build(mut self) -> PyResult<NpyMultiIter<'py, T, S>> {
         assert!(self.arrays.len() <= i32::MAX as usize);
         assert!(2 <= self.arrays.len());
-
-        let mut opflags = S::flags();
 
         let iter_ptr = unsafe {
             PY_ARRAY_API.NpyIter_MultiNew(
@@ -318,7 +340,7 @@ impl<'py, T: Element, S: MultiIterModeWithManyArrays> NpyMultiIterBuilder<'py, T
                 self.flags,
                 NPY_ORDER::NPY_ANYORDER,
                 NPY_CASTING::NPY_SAFE_CASTING,
-                opflags.as_mut_ptr(),
+                self.opflags.as_mut_ptr(),
                 ptr::null_mut(),
             )
         };
@@ -328,7 +350,7 @@ impl<'py, T: Element, S: MultiIterModeWithManyArrays> NpyMultiIterBuilder<'py, T
 }
 
 /// Multi iterator
-pub struct NpyMultiIter<'py, T, S: MultiIterModeWithManyArrays> {
+pub struct NpyMultiIter<'py, T, S> {
     iterator: ptr::NonNull<objects::NpyIter>,
     iternext: unsafe extern "C" fn(*mut objects::NpyIter) -> c_int,
     empty: bool,
@@ -338,7 +360,7 @@ pub struct NpyMultiIter<'py, T, S: MultiIterModeWithManyArrays> {
     _py: Python<'py>,
 }
 
-impl<'py, T, S: MultiIterModeWithManyArrays> NpyMultiIter<'py, T, S> {
+impl<'py, T, S> NpyMultiIter<'py, T, S> {
     fn new(iterator: *mut objects::NpyIter, py: Python<'py>) -> PyResult<Self> {
         let mut iterator = match ptr::NonNull::new(iterator) {
             Some(ptr) => ptr,
@@ -374,7 +396,9 @@ impl<'py, T, S: MultiIterModeWithManyArrays> NpyMultiIter<'py, T, S> {
     }
 }
 
-impl<'py, T, S: MultiIterModeWithManyArrays> Drop for NpyMultiIter<'py, T, S> {
+
+
+impl<'py, T, S> Drop for NpyMultiIter<'py, T, S> {
     fn drop(&mut self) {
         let _success = unsafe { PY_ARRAY_API.NpyIter_Deallocate(self.iterator.as_mut()) };
         // TODO: Handle _success somehow?
@@ -382,6 +406,36 @@ impl<'py, T, S: MultiIterModeWithManyArrays> Drop for NpyMultiIter<'py, T, S> {
 }
 
 macro_rules! impl_multi_iter {
+    ($expand: ident, $deref: expr) => {
+        impl <'py, T: 'py, S: TupleAppend<T>> std::iter::Iterator for NpyMultiIter<'py, T, S> {
+            type Item = S;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.empty {
+                    None
+                } else {
+                    // Note: This pointer is correct and doesn't need to be updated,
+                    // note that we're derefencing a **char into a *char casting to a *T
+                    // and then transforming that into a reference, the value that dataptr
+                    // points to is being updated by iternext to point to the next value.
+                    // let ($($ptr,)+) = unsafe { $expand::<T>(self.dataptr) };
+                    let $expand = self.dataptr;
+                    let retval = Some(unsafe { $deref });
+                    self.empty = unsafe { (self.iternext)(self.iterator.as_mut()) } == 0;
+                    retval
+                }
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                (self.iter_size as usize, Some(self.iter_size as usize))
+            }
+        }
+    }
+}
+
+impl_multi_iter!(ptr, ((*ptr).cast(),));
+
+/* macro_rules! impl_multi_iter {
     ($structure: ty, $($ty: ty)+, $($ptr: ident)+, $expand: ident, $deref: expr) => {
         impl<'py, T: 'py> std::iter::Iterator for NpyMultiIter<'py, T, $structure> {
             type Item = ($($ty,)+);
@@ -406,31 +460,4 @@ macro_rules! impl_multi_iter {
         }
     };
 }
-
-// Helper functions for conversion
-#[inline(always)]
-unsafe fn expand2<T>(dataptr: *mut *mut c_char) -> (*mut T, *mut T) {
-    (*dataptr as *mut T, *dataptr.offset(1) as *mut T)
-}
-
-#[inline(always)]
-unsafe fn expand3<T>(dataptr: *mut *mut c_char) -> (*mut T, *mut T, *mut T) {
-    (
-        *dataptr as *mut T,
-        *dataptr.offset(1) as *mut T,
-        *dataptr.offset(2) as *mut T,
-    )
-}
-
-impl_multi_iter!(RO<RO<()>>, &'py T &'py T, a b, expand2, (&*a, &*b));
-impl_multi_iter!(RO<RW<()>>, &'py mut T &'py T, a b, expand2, (&mut *a, &*b));
-impl_multi_iter!(RW<RO<()>>, &'py T &'py mut T, a b, expand2, (&*a, &mut *b));
-impl_multi_iter!(RW<RW<()>>, &'py mut T &'py mut T, a b, expand2, (&mut *a, &mut *b));
-impl_multi_iter!(RO<RO<RO<()>>>, &'py T &'py T &'py T, a b c, expand3, (&*a, &*b, &*c));
-impl_multi_iter!(RO<RO<RW<()>>>, &'py mut T &'py T &'py T, a b c, expand3, (&mut *a, &*b, &*c));
-impl_multi_iter!(RO<RW<RO<()>>>, &'py T &'py mut T &'py T, a b c, expand3, (&*a, &mut *b, &*c));
-impl_multi_iter!(RW<RO<RO<()>>>, &'py T &'py T &'py mut T, a b c, expand3, (&*a, &*b, &mut *c));
-impl_multi_iter!(RO<RW<RW<()>>>, &'py mut T &'py mut T &'py T, a b c, expand3, (&mut *a, &mut *b, &*c));
-impl_multi_iter!(RW<RO<RW<()>>>, &'py mut T &'py T &'py mut T, a b c, expand3, (&mut *a, &*b, &mut *c));
-impl_multi_iter!(RW<RW<RO<()>>>, &'py T &'py mut T &'py mut T, a b c, expand3, (&*a, &mut *b, &mut *c));
-impl_multi_iter!(RW<RW<RW<()>>>, &'py mut T &'py mut T &'py mut T, a b c, expand3, (&mut *a, &mut *b, &mut *c));
+*/
